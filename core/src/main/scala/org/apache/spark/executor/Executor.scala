@@ -135,21 +135,6 @@ private[spark] class Executor(
     }
   }
 
-  /**
-   * Function to kill the running tasks in an executor.
-   * This can be called by executor back-ends to kill the
-   * tasks instead of taking the JVM down.
-   * @param interruptThread whether to interrupt the task thread
-   */
-  def killAllTasks(interruptThread: Boolean) : Unit = {
-    // kill all the running tasks
-    for (taskRunner <- runningTasks.values().asScala) {
-      if (taskRunner != null) {
-        taskRunner.kill(interruptThread)
-      }
-    }
-  }
-
   def stop(): Unit = {
     env.metricsSystem.report()
     heartbeater.shutdown()
@@ -233,10 +218,22 @@ private[spark] class Executor(
           threwException = false
           res
         } finally {
+          val releasedLocks = env.blockManager.releaseAllLocksForTask(taskId)
           val freedMemory = taskMemoryManager.cleanUpAllAllocatedMemory()
           if (freedMemory > 0) {
             val errMsg = s"Managed memory leak detected; size = $freedMemory bytes, TID = $taskId"
             if (conf.getBoolean("spark.unsafe.exceptionOnMemoryLeak", false) && !threwException) {
+              throw new SparkException(errMsg)
+            } else {
+              logError(errMsg)
+            }
+          }
+
+          if (releasedLocks.nonEmpty) {
+            val errMsg =
+              s"${releasedLocks.size} block locks were not released by TID = $taskId:\n" +
+              releasedLocks.mkString("[", ", ", "]")
+            if (conf.getBoolean("spark.storage.exceptionOnPinLeak", false) && !threwException) {
               throw new SparkException(errMsg)
             } else {
               logError(errMsg)
@@ -302,9 +299,9 @@ private[spark] class Executor(
           logInfo(s"Executor killed $taskName (TID $taskId)")
           execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
 
-        case cDE: CommitDeniedException =>
-          val reason = cDE.toTaskEndReason
-          execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
+        // case CausedBy(cDE: CommitDeniedException) =>
+        //   val reason = cDE.toTaskEndReason
+        //   execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
 
         case t: Throwable =>
           // Attempt to exit cleanly by informing the driver of our failure.
@@ -380,9 +377,9 @@ private[spark] class Executor(
         val _userClassPathFirst: java.lang.Boolean = userClassPathFirst
         val klass = Utils.classForName("org.apache.spark.repl.ExecutorClassLoader")
           .asInstanceOf[Class[_ <: ClassLoader]]
-        val constructor = klass.getConstructor(classOf[SparkConf], classOf[SparkEnv],
-          classOf[String], classOf[ClassLoader], classOf[Boolean])
-        constructor.newInstance(conf, env, classUri, parent, _userClassPathFirst)
+        val constructor = klass.getConstructor(classOf[SparkConf], classOf[String],
+          classOf[ClassLoader], classOf[Boolean])
+        constructor.newInstance(conf, classUri, parent, _userClassPathFirst)
       } catch {
         case _: ClassNotFoundException =>
           logError("Could not find org.apache.spark.repl.ExecutorClassLoader on classpath!")
